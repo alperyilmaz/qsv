@@ -17,9 +17,12 @@ use once_cell::sync::{Lazy, OnceCell};
 use rand::Rng;
 use redis;
 use regex::Regex;
+use reqwest::blocking::multipart;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::fs::File;
+use std::io::prelude::*;
 use std::time::Instant;
 use std::{fs, thread, time};
 use url::Url;
@@ -150,6 +153,8 @@ Fetch options:
                                change Redis settings.
     --flushdb                  Flush all the keys in the current Redis database on startup.
                                This option is ignored if the --redis option is NOT enabled.
+    --max-filesize             Maximum filesize when sending files in bytes. (10 megabytes)
+                               [default: 10000000 ]
 
 Common options:
     -h, --help                 Display this message
@@ -183,6 +188,7 @@ struct Args {
     flag_output: Option<String>,
     flag_no_headers: bool,
     flag_delimiter: Option<Delimiter>,
+    flag_max_filesize: u64,
     flag_quiet: bool,
     arg_url_column: SelectColumns,
     arg_column_list: SelectColumns,
@@ -547,6 +553,61 @@ pub fn run(argv: &[&str]) -> CliResult<()> {
         }
         debug!("{form_body_jsonmap:?}");
 
+        let mut multipart_form = multipart::Form::new();
+        for col_idx in col_list.iter() {
+            let header_key = String::from_utf8_lossy(headers.get(*col_idx).unwrap()).to_string();
+            let value_string =
+                unsafe { std::str::from_utf8_unchecked(&record[*col_idx]).to_string() };
+            let file_part;
+            if value_string.starts_with("file:") {
+                let fname = &value_string[5..];
+                let mut buf = Vec::new();
+                if let Ok(f) = File::open(fname) {
+                    let mut openfile = f;
+                    let bytes_read = if let Ok(filesize) = openfile.read(&mut buf) {
+                        filesize as u64
+                    } else {
+                        0_u64
+                    };
+                    if bytes_read > 0 && bytes_read <= args.flag_max_filesize {
+                        file_part = multipart::Part::bytes(buf)
+                            .file_name(fname.to_owned())
+                            .mime_str("application/octet-stream")?;
+                    } else {
+                        file_part = multipart::Part::text(value_string);
+                    }
+                    multipart_form = multipart_form.part(header_key, file_part);
+                } else {
+                    multipart_form = multipart_form.text(header_key.clone(), value_string);
+                };
+            } else {
+                multipart_form = multipart_form.text(header_key.clone(), value_string);
+            }
+        }
+
+        //                 use reqwest::blocking::multipart;
+
+        // let form = multipart::Form::new()
+        //     // Adding just a simple text field...
+        //     .text("username", "seanmonstar")
+        //     // And a file...
+        //     .file("photo", "/path/to/photo.png")?;
+
+        // // Customize all the details of a Part if needed...
+        // let bio = multipart::Part::text("hallo peeps")
+        //     .file_name("bio.txt")
+        //     .mime_str("text/plain")?;
+
+        // // Add the custom part to our form...
+        // let form = form.part("biography", bio);
+
+        // // And finally, send the form
+        // let client = reqwest::blocking::Client::new();
+        // let resp = client
+        //     .post("http://localhost:8080/user")
+        //     .multipart(form)
+        //     .send()?;
+
         if literal_url_used {
             url = literal_url.clone();
         } else if let Ok(s) = std::str::from_utf8(&record[column_index]) {
@@ -561,7 +622,7 @@ pub fn run(argv: &[&str]) -> CliResult<()> {
         } else if args.flag_redis {
             intermediate_redis_value = get_redis_response(
                 &url,
-                &form_body_jsonmap,
+                &multipart_form,
                 &client,
                 &limiter,
                 &jql_selector,
@@ -595,7 +656,7 @@ pub fn run(argv: &[&str]) -> CliResult<()> {
         } else {
             intermediate_value = get_cached_response(
                 &url,
-                &form_body_jsonmap,
+                &multipart_form,
                 &client,
                 &limiter,
                 &jql_selector,
@@ -722,12 +783,13 @@ pub fn run(argv: &[&str]) -> CliResult<()> {
 #[cached(
     size = 2_000_000,
     key = "String",
-    convert = r#"{ format!("{:?}", form_body_jsonmap) }"#,
+    convert = r#"{ format!("{:?}", multipart_form) }"#,
     with_cached_flag = true
 )]
 fn get_cached_response(
     url: &str,
-    form_body_jsonmap: &serde_json::Map<String, Value>,
+    // form_body_jsonmap: &serde_json::Map<String, Value>,
+    multipart_form: &multipart::Form,
     client: &reqwest::blocking::Client,
     limiter: &governor::RateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>,
     flag_jql: &Option<String>,
@@ -738,7 +800,7 @@ fn get_cached_response(
 ) -> cached::Return<FetchResponse> {
     Return::new(get_response(
         url,
-        form_body_jsonmap,
+        multipart_form,
         client,
         limiter,
         flag_jql,
@@ -755,7 +817,7 @@ fn get_cached_response(
 #[io_cached(
     type = "cached::RedisCache<String, String>",
     key = "String",
-    convert = r#"{ format!("{}{:?}{:?}{}{}{}", url, form_body_jsonmap, flag_jql, flag_store_error, flag_pretty, include_existing_columns) }"#,
+    convert = r#"{ format!("{}{:?}{:?}{}{}{}", url, multipart_form, flag_jql, flag_store_error, flag_pretty, include_existing_columns) }"#,
     create = r##" {
         RedisCache::new("fp", REDISCONFIG.ttl_secs)
             .set_namespace("q")
@@ -770,7 +832,8 @@ fn get_cached_response(
 )]
 fn get_redis_response(
     url: &str,
-    form_body_jsonmap: &serde_json::Map<String, Value>,
+    // form_body_jsonmap: &serde_json::Map<String, Value>,
+    multipart_form: &multipart::Form,
     client: &reqwest::blocking::Client,
     limiter: &governor::RateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>,
     flag_jql: &Option<String>,
@@ -782,7 +845,8 @@ fn get_redis_response(
     Ok(Return::new({
         serde_json::to_string(&get_response(
             url,
-            form_body_jsonmap,
+            // form_body_jsonmap,
+            multipart_form,
             client,
             limiter,
             flag_jql,
@@ -798,7 +862,8 @@ fn get_redis_response(
 #[inline]
 fn get_response(
     url: &str,
-    form_body_jsonmap: &serde_json::Map<String, Value>,
+    // form_body_jsonmap: &serde_json::Map<String, Value>,
+    multipart_form: &multipart::Form,
     client: &reqwest::blocking::Client,
     limiter: &governor::RateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>,
     flag_jql: &Option<String>,
@@ -872,7 +937,11 @@ fn get_response(
         }
 
         // send the actual request
-        if let Ok(resp) = client.post(&valid_url).form(form_body_jsonmap).send() {
+        // if let Ok(resp) = client.post(&valid_url).form(form_body_jsonmap).send() {
+        let form = multipart::Form::new();
+        multipart_form.clone_into(&mut form);
+        if let Ok(resp) = client.post(&valid_url).multipart(form).send() {
+
             // debug!("{resp:?}");
             api_respheader.clone_from(resp.headers());
             api_status = resp.status();

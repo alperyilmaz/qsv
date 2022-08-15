@@ -192,6 +192,7 @@ fetch = [
     "jql",
     "jsonxf",
     "redis",
+    "reqwest/multipart",
     "url",
 ]
 foreach = []
